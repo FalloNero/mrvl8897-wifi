@@ -1,0 +1,102 @@
+;
+; mrvl8897.inf - Marvell 88W8897 SDIO WLAN function (community port of Linux mwifiex)
+; WiFiCx / NetAdapterCx client: installs as a Wi-Fi network adapter.
+; Test-signed. GPL v2 driver, Marvell firmware under LICENCE.Marvell.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Net
+ClassGuid   = {4d36e972-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = mrvl8897.cat
+DriverVer   = 11/16/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+Fw_CopyFiles   = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+mrvl8897.sys      = 1
+sd8897_uapsta.bin = 1
+
+[Manufacturer]
+%MfgName% = Mrvl, NTamd64.10.0...22000
+
+[Mrvl.NTamd64.10.0...22000]
+; 912C = 8897 card-level ID as enumerated by Windows sdbus, function 1 = WLAN
+%DevDesc% = Mrvl_Inst, SD\VID_02DF&PID_912C&FN_1
+; 912D = 8897 WLAN function ID (as used by Linux mwifiex)
+%DevDesc% = Mrvl_Inst, SD\VID_02DF&PID_912D&FN_1
+%DevDesc% = Mrvl_Inst, SD\VID_02DF&PID_912D
+
+[Mrvl_Inst.NT]
+CopyFiles       = Drv_CopyFiles, Fw_CopyFiles
+AddReg          = Mrvl_Ndi, Mrvl_BootTrace
+Characteristics = 0x84          ; NCF_HAS_UI | NCF_PHYSICAL
+BusType         = 0             ; Internal
+*IfType            = 71         ; IF_TYPE_IEEE80211
+*MediaType         = 16         ; NdisMediumNative802_11
+*PhysicalMediaType = 9          ; NdisPhysicalMediumNative802_11
+*IfConnectorPresent = 1
+*ConnectionType     = 1         ; NET_IF_CONNECTION_DEDICATED
+*DirectionType      = 0         ; NET_IF_DIRECTION_SENDRECEIVE
+*AccessType         = 2         ; NET_IF_ACCESS_BROADCAST
+*HardwareLoopback   = 0
+
+[Mrvl_Ndi]
+HKR, Ndi,            Service,    0, "mrvl8897"
+HKR, Ndi\Interfaces, UpperRange, 0, "ndis5"
+HKR, Ndi\Interfaces, LowerRange, 0, "wlan,ethernet"
+
+; Boot-time trace of the SD bus driver (Windows "AutoLogger", starts before drivers load).
+; The card's firmware download only completes while sdbus tracing is active (timing), so this
+; is always on. 64 MB ring file: %SystemRoot%\System32\LogFiles\WMI\mrvl8897-sdbus.etl
+[Mrvl_BootTrace]
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus", Start,          0x00010001, 1
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus", Guid,           0x00000000, "{6c3a9e51-8f27-4d0b-9b1e-3f5d2a8c7e14}"
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus", FileName,       0x00000000, "%10%\System32\LogFiles\WMI\mrvl8897-sdbus.etl"
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus", LogFileMode,    0x00010001, 0x00000002
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus", MaxFileSize,    0x00010001, 64
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus", BufferSize,     0x00010001, 256
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus", MinimumBuffers, 0x00010001, 16
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus", MaximumBuffers, 0x00010001, 64
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus\{3B9E3DA4-70B8-46D3-9EF2-3DDF128BDED8}", Enabled,     0x00010001, 1
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus\{3B9E3DA4-70B8-46D3-9EF2-3DDF128BDED8}", EnableLevel, 0x00010001, 0xFF
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus\{3B9E3DA4-70B8-46D3-9EF2-3DDF128BDED8}", EnableFlags, 0x00010001, 0xFFFFFFFF
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus\{9C205A39-1250-487D-ABD7-E831C6290539}", Enabled,     0x00010001, 1
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus\{9C205A39-1250-487D-ABD7-E831C6290539}", EnableLevel, 0x00010001, 0xFF
+HKLM, "SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus\{9C205A39-1250-487D-ABD7-E831C6290539}", EnableFlags, 0x00010001, 0xFFFFFFFF
+
+[Drv_CopyFiles]
+mrvl8897.sys
+
+[Fw_CopyFiles]
+sd8897_uapsta.bin
+
+[Mrvl_Inst.NT.Services]
+AddService = mrvl8897, 0x00000002, Mrvl_Service
+
+[Mrvl_Service]
+DisplayName   = %SvcDesc%
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\mrvl8897.sys
+
+[Mrvl_Inst.NT.Wdf]
+KmdfService = mrvl8897, Mrvl_WdfSect
+
+[Mrvl_WdfSect]
+KmdfLibraryVersion = 1.33
+
+[Strings]
+ProviderName = "mrvl8897 community port"
+MfgName      = "Marvell"
+DevDesc      = "Marvell 88W8897 Wireless (SDIO)"
+SvcDesc      = "Marvell 88W8897 SDIO WLAN driver"
+DiskName     = "mrvl8897 Install Disk"
