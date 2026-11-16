@@ -1,6 +1,6 @@
 # mrvl8897 — Marvell 88W8897 SDIO Wi-Fi driver for Windows 11
 
-**Version 1.0**
+**Version 1.7**
 
 A Windows 11 x64 driver for the **Marvell 88W8897 Wi-Fi chip on SDIO**, developed and tested on
 the **Dell Wyse 3040** thin client (Intel Cherry Trail, SDIO host 8086:2295). Marvell only ever
@@ -24,11 +24,18 @@ Working:
 - Connecting to open and WPA2-Personal networks (CCMP); the WPA2 handshake is done by Windows
 - Data in both directions (internet works)
 - Disconnect, link loss and AP-initiated disconnect
+- 802.11n (HT): up to 2 streams, short guard interval, 40 MHz on 5 GHz (link speed up to
+  300 Mbps), WMM/QoS, A-MSDU receive, RX block-ack sessions (A-MPDU from the router)
+- Warm restarts
 
 Not yet:
 - Other machines with the SDIO 88W8897 are untested (they should work if the SD host is
   handled by Windows' sdbus)
-- 802.11n / 802.11ac rates (currently 802.11a/b/g, up to 54 Mbps, 20 MHz)
+- 802.11ac; DFS channels 52-144; TX block-ack (upload aggregation); RX reorder buffer
+- Real throughput is far below the link speed (about 30 Mbit/s measured with iperf): every
+  packet is a separate SDIO transfer (no SDIO multi-port aggregation yet)
+- Booting is occasionally flaky (the device shows a yellow bang); a full power-off with the
+  power cord unplugged brings it back
 - WPA3-only networks (WPA2/WPA3 mixed networks connect via WPA2), TKIP pairwise, WEP
 - Sleep / hibernate / Fast Startup: Wi-Fi will probably not come back after resume (the card
   can't be re-initialised without a power cycle); use Shut down / Restart instead of sleep
@@ -61,6 +68,11 @@ Shut down completely (hold **Shift** while clicking Shut down), then power on. O
 firmware has run, the card can only be initialised again after it lost power, so this cold
 power-cycle is needed **after installing or updating the driver** (and after disabling/enabling
 the device). From then on Wi-Fi comes up by itself at every boot, restarts included.
+
+If the device is missing or shows a yellow bang even after that, shut down, **unplug the power
+cord** for a few minutes and power on again: a "shut down" leaves standby power on the card, and
+a card that failed to start only recovers once it really loses power. There is no software way
+to power-cycle the card on the Wyse 3040 (see docs/TECHNICAL.md).
 
 ## Build
 
@@ -112,8 +124,9 @@ HKLM\SYSTEM\CurrentControlSet\Services\mrvl8897\Parameters
     MacAddress, FwVersion, AutoAttempts
 ```
 
-`SdioFlags` (DWORD, same key) holds debug options; 0 is the normal value (bit `0x200` disables the
-pacing delays around firmware chunks).
+`SdioFlags` (DWORD, same key) holds debug options; 0 is the normal value. Bit `0x800` turns
+802.11n off (connect as 802.11a/g), bit `0x200` disables the pacing delays around firmware
+chunks.
 
 If Wi-Fi doesn't come up after an install or update, do the cold power-cycle from step 3.
 

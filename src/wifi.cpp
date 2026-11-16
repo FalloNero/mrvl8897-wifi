@@ -131,6 +131,11 @@ typedef struct _WIFI_CTX {
     LONG                Rssi;
     WDI_MESSAGE_HEADER  ConnHdr;          /* header of the connect M1 (port id for indications) */
     BOOLEAN             GtkSet;
+    BOOLEAN             Ht;               /* 802.11n negotiated */
+    BOOLEAN             Use40;            /* 40 MHz */
+    BOOLEAN             Sgi;              /* short guard interval */
+    BOOLEAN             Wmm;
+    UCHAR               Streams;
 
     /* TX: Advance -> slots -> sender thread -> card */
     FRAME_SLOT         *TxSlots;
@@ -236,6 +241,21 @@ static const UCHAR *FindIe(const UCHAR *Body, ULONG BodyLen, UCHAR Id)
         UCHAR l = Body[p + 1];
         if (p + 2 + l > BodyLen) break;
         if (Body[p] == Id) return Body + p;
+        p += 2 + l;
+    }
+    return nullptr;
+}
+
+/* WMM information/parameter element: vendor IE 221, OUI 00:50:F2, type 2 */
+static const UCHAR *FindWmmIe(const UCHAR *Body, ULONG BodyLen)
+{
+    ULONG p = 12;
+    while (p + 2 <= BodyLen) {
+        UCHAR l = Body[p + 1];
+        if (p + 2 + l > BodyLen) break;
+        if (Body[p] == 221 && l >= 5 && Body[p + 2] == 0x00 && Body[p + 3] == 0x50 &&
+            Body[p + 4] == 0xF2 && Body[p + 5] == 0x02)
+            return Body + p;
         p += 2 + l;
     }
     return nullptr;
@@ -355,9 +375,13 @@ static void IndicateLinkState(PWIFI_CTX W)
     ULONG outLen = 0;
     PDEVICE_CONTEXT ctx = GetCtx(W->Device);
 
+    /* nominal top rate, kbps: HT MCS7 per stream = 65 / 72.2 (SGI) at 20 MHz, 135 / 150 at 40 MHz */
+    ULONG kbps = 54000;
+    if (W->Ht)
+        kbps = W->Streams * (W->Use40 ? (W->Sgi ? 150000u : 135000u) : (W->Sgi ? 72200u : 65000u));
     RtlCopyMemory(&prm.LinkStateChangeParameters.PeerMACAddress, W->Bssid, 6);
-    prm.LinkStateChangeParameters.TxLinkSpeed = 54000;   /* kbps (legacy rates until 11n is added) */
-    prm.LinkStateChangeParameters.RxLinkSpeed = 54000;
+    prm.LinkStateChangeParameters.TxLinkSpeed = kbps;
+    prm.LinkStateChangeParameters.RxLinkSpeed = kbps;
     prm.LinkStateChangeParameters.LinkQuality = (UINT8)LinkQualityFromRssi(W->Rssi);
     link.LinkID = 0;
     RtlCopyMemory(&link.LocalLinkMACAddress, ctx->Mac, 6);
@@ -365,9 +389,9 @@ static void IndicateLinkState(PWIFI_CTX W)
     link.ChannelNumber = W->Channel;
     link.BandId = W->Is5GHz ? WDI_BAND_ID_5000 : WDI_BAND_ID_2400;
     link.RSSI = W->Rssi;
-    link.Bandwidth = 20;
-    link.TxMCS = 0;
-    link.RxMCS = 0;
+    link.Bandwidth = W->Use40 ? 40 : 20;
+    link.TxMCS = W->Ht ? (W->Streams == 2 ? 15 : 7) : 0;
+    link.RxMCS = link.TxMCS;
     prm.LinkInfo.SimpleAssign(&link, 1);
     if (GenerateWdiIndicationLinkStateChange(&prm, 0, &W->Tlv, &outLen, &out) == NDIS_STATUS_SUCCESS && out) {
         Indicate(W->Device, WDI_INDICATION_LINK_STATE_CHANGE, &W->ConnHdr, 0, NDIS_STATUS_SUCCESS, out, outLen);
@@ -577,9 +601,72 @@ static void DoConnect(WDFDEVICE Dev, WIFIREQUEST Req, PWDI_MESSAGE_HEADER Hdr, U
     }
     PutLe16(cmd + p, TLV_TYPE_AUTH_TYPE); PutLe16(cmd + p + 2, 2); p += 4;   /* open system auth */
     PutLe16(cmd + p, 0); p += 2;
-    PutLe16(cmd + p, TLV_TYPE_CHANLIST); PutLe16(cmd + p + 2, 7); p += 4;    /* the AP's channel */
-    cmd[p++] = is5 ? 1 : 0; cmd[p++] = chan; cmd[p++] = 0;
-    PutLe16(cmd + p, 0); p += 2; PutLe16(cmd + p, 0); p += 2;
+    {
+        /*
+         * 802.11n + WMM (mwifiex 11n.c mwifiex_cmd_append_11n_tlv, wmm.c): only with an
+         * HT-capable AP and CCMP/open (HT forbids TKIP/WEP). 40 MHz only on 5 GHz and
+         * only if the AP runs 40 MHz; the secondary channel offset goes into the
+         * channel TLV's radio-type byte (bits 4-5: 1 = above, 3 = below).
+         */
+        const UCHAR *apHtCap = FindIe(body, bodyLen, 45), *apHtOp = FindIe(body, bodyLen, 61);
+        const UCHAR *apWmm = FindWmmIe(body, bodyLen);
+        ULONG dc = ctx->Dot11nDevCap;
+        BOOLEAN ht = !(ctx->Options & 0x800) &&            /* SdioFlags 0x800: 802.11n off */
+                     (ctx->FwCapInfo & (1u << 11)) && apHtCap && apHtOp && apHtOp[1] >= 22 &&
+                     (ucast == WDI_CIPHER_ALGO_CCMP || ucast == WDI_CIPHER_ALGO_NONE);
+        UCHAR secOff = 0;
+        w->Use40 = FALSE;
+        w->Sgi = FALSE;
+        w->Streams = 1;
+        if (ht && is5 && (dc & (1u << 17)) && (apHtOp[3] & 0x04))
+            secOff = apHtOp[3] & 0x03;
+        if (secOff != 1 && secOff != 3)
+            secOff = 0;
+
+        PutLe16(cmd + p, TLV_TYPE_CHANLIST); PutLe16(cmd + p + 2, 7); p += 4;    /* the AP's channel */
+        cmd[p++] = (UCHAR)((is5 ? 1 : 0) | (secOff << 4)); cmd[p++] = chan; cmd[p++] = 0;
+        PutLe16(cmd + p, 0); p += 2; PutLe16(cmd + p, 0); p += 2;
+
+        if (ht) {
+            UCHAR htc[26];
+            USHORT capInfo = 0x000C | 0x1000;                 /* SM power save off, DSSS/CCK in 40 MHz */
+            RtlZeroMemory(htc, sizeof(htc));
+            if (is5 && (dc & (1u << 17))) capInfo |= 0x0002;  /* 20/40 MHz */
+            if (dc & (1u << 23)) capInfo |= 0x0020;           /* short GI 20 */
+            if ((dc & (1u << 24)) && (capInfo & 0x0002)) capInfo |= 0x0040;   /* short GI 40 */
+            if (dc & (1u << 25)) capInfo |= 0x0080;           /* TX STBC */
+            if (dc & (1u << 26)) capInfo |= 0x0100;           /* RX STBC, 1 stream */
+            if (dc & (1u << 22)) capInfo |= 0x0001;           /* LDPC */
+            PutLe16(htc, capInfo);
+            htc[2] = 0x03;                                    /* A-MPDU 64 KB, no spacing */
+            htc[3] = 0xFF;                                    /* MCS 0-7 */
+            if ((ctx->DevMcsSupport & 0x0F) >= 2) htc[4] = 0xFF;   /* MCS 8-15 (2 streams) */
+            if (capInfo & 0x0002) htc[7] |= 0x01;             /* MCS 32 */
+            htc[15] = 0x01;                                   /* TX MCS set defined */
+            PutLe16(cmd + p, 45); PutLe16(cmd + p + 2, sizeof(htc)); p += 4;
+            RtlCopyMemory(cmd + p, htc, sizeof(htc)); p += sizeof(htc);
+            reqFrame[reqLen++] = 45; reqFrame[reqLen++] = sizeof(htc);
+            RtlCopyMemory(reqFrame + reqLen, htc, sizeof(htc)); reqLen += sizeof(htc);
+            PutLe16(cmd + p, 61); PutLe16(cmd + p + 2, 22); p += 4;    /* HT operation, as the AP sent it */
+            RtlCopyMemory(cmd + p, apHtOp + 2, 22);
+            if (!secOff) cmd[p + 1] &= (UCHAR)~0x07;           /* we stay at 20 MHz */
+            p += 22;
+            w->Use40 = secOff != 0;
+            w->Sgi = (capInfo & (w->Use40 ? 0x0040 : 0x0020)) != 0;
+            w->Streams = (ctx->DevMcsSupport & 0x0F) >= 2 ? 2 : 1;
+        }
+        if (apWmm) {
+            static const UCHAR wmm[7] = { 0x00, 0x50, 0xF2, 0x02, 0x00, 0x01, 0x00 };   /* WMM info, no U-APSD */
+            PutLe16(cmd + p, 221); PutLe16(cmd + p + 2, sizeof(wmm)); p += 4;
+            RtlCopyMemory(cmd + p, wmm, sizeof(wmm)); p += sizeof(wmm);
+            reqFrame[reqLen++] = 221; reqFrame[reqLen++] = sizeof(wmm);
+            RtlCopyMemory(reqFrame + reqLen, wmm, sizeof(wmm)); reqLen += sizeof(wmm);
+        }
+        w->Ht = ht;
+        w->Wmm = apWmm != nullptr;
+        LOG("wifi: 802.11n %s%s, WMM %s", ht ? "on" : "off", ht ? (secOff ? " 40 MHz" : " 20 MHz") : "",
+            apWmm ? "on" : "off");
+    }
     if (rsnLen) {
         PutLe16(cmd + p, 48); PutLe16(cmd + p + 2, (USHORT)(rsnLen - 2)); p += 4;   /* RSN IE TLV */
         RtlCopyMemory(cmd + p, rsnIe + 2, rsnLen - 2); p += rsnLen - 2;
@@ -613,7 +700,8 @@ report:
     {
         WDI_INDICATION_ASSOCIATION_RESULT_LIST lst;
         WDI_ASSOCIATION_RESULT_CONTAINER res;
-        WDI_PHY_TYPE phy = is5 ? WDI_PHY_TYPE_OFDM : WDI_PHY_TYPE_ERP;
+        WDI_PHY_TYPE phy = (assoc == WDI_ASSOC_STATUS_SUCCESS && w->Ht) ? WDI_PHY_TYPE_HT :
+                           is5 ? WDI_PHY_TYPE_OFDM : WDI_PHY_TYPE_ERP;
         UINT8 *out = nullptr;
         ULONG outLen = 0;
 
@@ -628,7 +716,7 @@ report:
         res.AssociationResultParameters.MulticastMgmtCipherAlgorithm = WDI_CIPHER_ALGO_NONE;
         res.AssociationResultParameters.FourAddressSupported = FALSE;
         res.AssociationResultParameters.PortAuthorized = FALSE;
-        res.AssociationResultParameters.WMMQoSEnabled = FALSE;
+        res.AssociationResultParameters.WMMQoSEnabled = (assoc == WDI_ASSOC_STATUS_SUCCESS && w->Wmm) ? TRUE : FALSE;
         res.AssociationResultParameters.DSInfo = WDI_DS_UNKNOWN;
         res.AssociationResultParameters.BandID = is5 ? WDI_BAND_ID_5000 : WDI_BAND_ID_2400;
         if (assoc == WDI_ASSOC_STATUS_SUCCESS) {
@@ -1300,7 +1388,7 @@ static NTSTATUS EvtWifiCreateAdapter(WDFDEVICE Device, NETADAPTER_INIT *AdapterI
         return st;
     }
 
-    NET_ADAPTER_LINK_LAYER_CAPABILITIES_INIT(&ll, 54000000ULL, 54000000ULL);
+    NET_ADAPTER_LINK_LAYER_CAPABILITIES_INIT(&ll, 300000000ULL, 300000000ULL);
     NetAdapterSetLinkLayerCapabilities(adapter, &ll);
     NetAdapterSetLinkLayerMtuSize(adapter, 1500);
     NET_ADAPTER_TX_CAPABILITIES_INIT(&tx, 1);
@@ -1488,7 +1576,7 @@ extern "C" NTSTATUS WifiReportCapabilities(PDEVICE_CONTEXT Ctx)
         c.DefaultKeyTableSize = 4;
         c.WEPKeyValueMaxLength = 13;
         c.MaxNumPerSTA = 4;
-        c.SupportedQOSFlags = 0;
+        c.SupportedQOSFlags = 1;          /* WMM */
         c.HostFIPSModeImplemented = FALSE;
         c.MFPCapable = FALSE;
         c.AutoPowerSaveMode = FALSE;
@@ -1506,9 +1594,10 @@ extern "C" NTSTATUS WifiReportCapabilities(PDEVICE_CONTEXT Ctx)
 
     /* --- bands --- */
     {
-        static WDI_PHY_TYPE phy24[] = { WDI_PHY_TYPE_HRDSSS, WDI_PHY_TYPE_ERP };
-        static WDI_PHY_TYPE phy5[] = { WDI_PHY_TYPE_OFDM };
+        static WDI_PHY_TYPE phy24[] = { WDI_PHY_TYPE_HRDSSS, WDI_PHY_TYPE_ERP, WDI_PHY_TYPE_HT };
+        static WDI_PHY_TYPE phy5[] = { WDI_PHY_TYPE_OFDM, WDI_PHY_TYPE_HT };
         static UINT32 w20[] = { 20 };
+        static UINT32 w40[] = { 20, 40 };
         WIFI_BAND_INFO bands[2] = {};
         WIFI_BAND_CAPABILITIES c;
         RtlZeroMemory(&c, sizeof(c));
@@ -1527,8 +1616,8 @@ extern "C" NTSTATUS WifiReportCapabilities(PDEVICE_CONTEXT Ctx)
         bands[1].ValidPhyTypeList = phy5;
         bands[1].NumValidChannelTypes = ARRAYSIZE(g_Chan5);
         bands[1].ValidChannelTypes = const_cast<WDI_CHANNEL_MAPPING_ENTRY *>(g_Chan5);
-        bands[1].NumChannelWidths = ARRAYSIZE(w20);
-        bands[1].ChannelWidthList = w20;
+        bands[1].NumChannelWidths = ARRAYSIZE(w40);
+        bands[1].ChannelWidthList = w40;
         c.NumBands = 2;
         c.BandInfoList = bands;
         st = WifiDeviceSetBandCapabilities(dev, &c);
@@ -1539,10 +1628,13 @@ extern "C" NTSTATUS WifiReportCapabilities(PDEVICE_CONTEXT Ctx)
     {
         static const UINT16 rB[] = { 2, 4, 11, 22 };
         static const UINT16 rOfdm[] = { 12, 18, 24, 36, 48, 72, 96, 108 };
+        /* HT MCS 0-15, 20 MHz long GI, plus the 2-stream SGI / 40 MHz tops (500 kbps units) */
+        static const UINT16 rHt[] = { 13, 26, 39, 52, 78, 104, 117, 130, 156, 208, 234, 260, 289, 540, 600 };
         struct { WDI_PHY_TYPE t; const UINT16 *r; ULONG n; } def[] = {
             { WDI_PHY_TYPE_HRDSSS, rB, ARRAYSIZE(rB) },
             { WDI_PHY_TYPE_ERP, rOfdm, ARRAYSIZE(rOfdm) },
             { WDI_PHY_TYPE_OFDM, rOfdm, ARRAYSIZE(rOfdm) },
+            { WDI_PHY_TYPE_HT, rHt, ARRAYSIZE(rHt) },
         };
         WIFI_PHY_INFO *info = static_cast<WIFI_PHY_INFO *>(MrvlAlloc(sizeof(WIFI_PHY_INFO) * ARRAYSIZE(def)));
         WIFI_PHY_CAPABILITIES c;

@@ -94,6 +94,8 @@ extern "C" {
 
 #define OPT_NO_FW_PACING 0x200   /* SdioFlags: no delays around firmware chunks */
 #define CMD_RESP_MAX                4096
+#define BA_QUEUE_LEN                8
+#define BA_RX_WIN_SIZE              64      /* mwifiex MWIFIEX_STA_AMPDU_DEF_RXWINSIZE */
 
 /* One scan result: BSSID, signal, channel and the beacon/probe-response body
  * (timestamp, beacon interval, capability, IEs) as WDI wants it. */
@@ -148,6 +150,8 @@ typedef struct _DEVICE_CONTEXT {
     BOOLEAN                  NeedReenum;
     BOOLEAN                  ReenumValid;
     BOOLEAN                  CountedAttempt;
+    BOOLEAN                  PrepareRan;  /* EvtDevicePrepareHardware was reached */
+    ULONG                    ReenumCount; /* re-detections done this boot before this instance */
     REENUMERATE_SELF_INTERFACE_STANDARD Reenum;
     KEVENT                   CmdDone;
 
@@ -164,7 +168,18 @@ typedef struct _DEVICE_CONTEXT {
     ULONG                    WrBitmap;    /* free card write (data) ports */
     ULONG                    CurrWrPort;
     UCHAR                    KeyApiMajor; /* 0/1 = KEY_MATERIAL v1, 2 = v2 */
+    ULONG                    FwCapInfo;   /* GET_HW_SPEC: bit 11 = 11n, bit 13 = 11ac */
+    ULONG                    Dot11nDevCap;
+    UCHAR                    DevMcsSupport; /* low nibble = RX streams */
+    ULONG                    Dot11acDevCap;
     UCHAR                    Resp[CMD_RESP_MAX];
+
+    /* block-ack (802.11n aggregation) firmware events, answered from BaWork */
+    KSPIN_LOCK               BaLock;
+    WDFWORKITEM              BaWork;
+    ULONG                    BaHead, BaTail;
+    struct { ULONG Event; UCHAR Body[16]; } BaQueue[BA_QUEUE_LEN];
+    volatile LONG            BaSessions;
 
     volatile LONG            IntCallbacks;
     volatile LONG            Events;
@@ -206,6 +221,7 @@ VOID     CardProcessInterrupt(PDEVICE_CONTEXT Ctx);
 NTSTATUS CardScan(PDEVICE_CONTEXT Ctx, const UCHAR *Ssid, ULONG SsidLen);   /* PASSIVE; fills ScanResults */
 NTSTATUS CardCommand(PDEVICE_CONTEXT Ctx, USHORT Cmd, const VOID *Payload, USHORT Len,
                      PUCHAR Out, ULONG OutMax, PULONG OutLen);
+VOID     CardBaWorker(WDFWORKITEM Item);   /* answers ADDBA / BA timeout events */
 NTSTATUS CardTxFrame(PDEVICE_CONTEXT Ctx, const UCHAR *Eth, ULONG Len, UCHAR Priority);
 
 /* wifi.cpp (WiFiCx / NetAdapterCx glue) */

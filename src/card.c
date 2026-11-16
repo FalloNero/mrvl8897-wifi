@@ -28,6 +28,39 @@ static USHORT GetLe16(const UCHAR *p) { return (USHORT)(p[0] | (p[1] << 8)); }
 static ULONG  GetLe32(const UCHAR *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((ULONG)p[3] << 24); }
 static VOID   PutLe16(UCHAR *p, USHORT v) { p[0] = (UCHAR)v; p[1] = (UCHAR)(v >> 8); }
 
+/*
+ * Block-ack events (mwifiex sta_event.c). The firmware reports the AP's ADDBA
+ * request (EVENT_ADDBA, body = host_cmd_ds_11n_addba_req) and BA timeouts; the
+ * host answers with a command. Events arrive with IoLock held, where no command
+ * can be sent, so they are queued for a work item.
+ */
+#define EVENT_ADDBA             0x0033
+#define EVENT_DELBA             0x0034
+#define EVENT_BA_STREAM_TIMEOUT 0x0037
+
+static VOID QueueBaEvent(PDEVICE_CONTEXT Ctx, ULONG Event, const UCHAR *Body, ULONG Len)
+{
+    KIRQL irql;
+    BOOLEAN queued = FALSE;
+    if (Event != EVENT_ADDBA && Event != EVENT_DELBA && Event != EVENT_BA_STREAM_TIMEOUT)
+        return;
+    if (Len > 0x10000)
+        Len = 0;                                         /* underflowed length */
+    KeAcquireSpinLock(&Ctx->BaLock, &irql);
+    if (Ctx->BaHead - Ctx->BaTail < BA_QUEUE_LEN) {
+        ULONG i = Ctx->BaHead++ % BA_QUEUE_LEN;
+        Ctx->BaQueue[i].Event = Event;
+        RtlZeroMemory(Ctx->BaQueue[i].Body, sizeof(Ctx->BaQueue[i].Body));
+        RtlCopyMemory(Ctx->BaQueue[i].Body, Body, min(Len, sizeof(Ctx->BaQueue[i].Body)));
+        queued = TRUE;
+    }
+    KeReleaseSpinLock(&Ctx->BaLock, irql);
+    if (!queued)
+        LOG("ba: event queue full, event 0x%04X dropped", Event);
+    else if (Ctx->BaWork)
+        WdfWorkItemEnqueue(Ctx->BaWork);
+}
+
 static NTSTATUS RegSetBits(PDEVICE_CONTEXT Ctx, ULONG Reg, UCHAR Bits)
 {
     UCHAR v;
@@ -344,6 +377,7 @@ static VOID HandleCmdPortUpload(PDEVICE_CONTEXT Ctx)
             Ctx->LastEvent = GetLe32(Ctx->RxBuf + INTF_HEADER_LEN) & 0xffff;
             InterlockedIncrement(&Ctx->Events);
             LOG("firmware event 0x%04X", Ctx->LastEvent);
+            QueueBaEvent(Ctx, Ctx->LastEvent, Ctx->RxBuf + INTF_HEADER_LEN + 4, pktLen - INTF_HEADER_LEN - 4);
             WifiFwEvent(Ctx, Ctx->LastEvent);
         }
     } else {
@@ -380,9 +414,30 @@ static VOID DeliverRxData(PDEVICE_CONTEXT Ctx, PUCHAR Pkt, ULONG PktLen)
         LOG("rx: packet type 0x%X ignored", type);
         return;
     }
-    if (type == 0xE6)
-        LOG("rx: A-MSDU (type 0xE6) not de-aggregated yet, passed as-is");
     f = rxpd + off;
+    if (type == 0xE6) {
+        /*
+         * A-MSDU (mwifiex 11n_aggr.c): a run of subframes, each DA[6] SA[6]
+         * be16 length + MSDU (SNAP + payload), padded to a multiple of 4.
+         * Each subframe has the same layout as an 802.3 frame.
+         */
+        ULONG p = 0;
+        while (p + 14 <= len) {
+            ULONG sub = ((ULONG)f[p + 12] << 8) | f[p + 13];
+            PUCHAR s = f + p;
+            ULONG slen = 14 + sub;
+            if (p + slen > len || sub < 8)
+                break;
+            if (RtlEqualMemory(s + 14, rfc1042, 6) || RtlEqualMemory(s + 14, tunnel, 6)) {
+                RtlMoveMemory(s + 8, s, 12);
+                WifiRxFrame(Ctx, s + 8, slen - 8);
+            } else {
+                WifiRxFrame(Ctx, s, slen);
+            }
+            p += (slen + 3) & ~3u;
+        }
+        return;
+    }
     /* 802.3 + SNAP -> Ethernet II: keep DA/SA, drop length + the 6 SNAP bytes */
     if (len >= 22 && (RtlEqualMemory(f + 14, rfc1042, 6) || RtlEqualMemory(f + 14, tunnel, 6))) {
         RtlMoveMemory(f + 8, f, 12);       /* DA, SA */
@@ -416,6 +471,7 @@ static VOID DrainDataPorts(PDEVICE_CONTEXT Ctx)
                 Ctx->LastEvent = GetLe32(Ctx->RxBuf + 4) & 0xffff;
                 InterlockedIncrement(&Ctx->Events);
                 LOG("firmware event 0x%04X (data port %u)", Ctx->LastEvent, port);
+                QueueBaEvent(Ctx, Ctx->LastEvent, Ctx->RxBuf + 8, plen - 8);
                 WifiFwEvent(Ctx, Ctx->LastEvent);
             } else if (type == MWIFIEX_TYPE_DATA) {
                 DeliverRxData(Ctx, Ctx->RxBuf, plen);
@@ -566,6 +622,15 @@ static NTSTATUS QueryFirmwareInfo(PDEVICE_CONTEXT Ctx)
     if (len >= HWSPEC_OFF_FW_RELEASE + 4) {
         RtlCopyMemory(Ctx->Mac, resp + HWSPEC_OFF_PERM_ADDR, 6);
         Ctx->FwRelease = GetLe32(resp + HWSPEC_OFF_FW_RELEASE);
+        if (len >= 63) {
+            /* fw_cap_info @34, dot_11n_dev_cap @38, dev_mcs_support @42, dot_11ac_dev_cap @55 */
+            Ctx->FwCapInfo = GetLe32(resp + 34);
+            Ctx->Dot11nDevCap = GetLe32(resp + 38);
+            Ctx->DevMcsSupport = resp[42];
+            Ctx->Dot11acDevCap = GetLe32(resp + 55);
+            LOG("HW spec: fw_cap 0x%08X 11n_cap 0x%08X mcs 0x%02X 11ac_cap 0x%08X",
+                Ctx->FwCapInfo, Ctx->Dot11nDevCap, Ctx->DevMcsSupport, Ctx->Dot11acDevCap);
+        }
         LOG("HW spec: MAC %02X:%02X:%02X:%02X:%02X:%02X fw_release 0x%08X",
             Ctx->Mac[0], Ctx->Mac[1], Ctx->Mac[2], Ctx->Mac[3], Ctx->Mac[4], Ctx->Mac[5],
             Ctx->FwRelease);
@@ -787,6 +852,16 @@ NTSTATUS CardBringUp(PDEVICE_CONTEXT Ctx, PCSTR *FailStage)
         st = SendCmd(Ctx, HostCmd_CMD_MAC_CONTROL, macCtl, sizeof(macCtl), NULL, NULL);
         LOG("MAC_CONTROL: 0x%08X", st);
     }
+    if (Ctx->FwCapInfo & (1u << 11)) {
+        /* HostCmd_CMD_11N_CFG (0xcd): action SET, ht_tx_cap = 20/40 MHz | greenfield |
+         * short GI 20 | short GI 40 (MWIFIEX_FW_DEF_HTTXCFG), ht_tx_info 0, misc 0 */
+        UCHAR c[8];
+        RtlZeroMemory(c, sizeof(c));
+        PutLe16(c, 1);
+        PutLe16(c + 2, 0x0072);
+        st = SendCmd(Ctx, 0x00cd, c, sizeof(c), NULL, NULL);
+        LOG("11N_CFG: 0x%08X", st);
+    }
 
     *FailStage = "ok";
     return STATUS_SUCCESS;
@@ -895,4 +970,83 @@ NTSTATUS CardTxFrame(PDEVICE_CONTEXT Ctx, const UCHAR *Eth, ULONG Len, UCHAR Pri
     }
     WdfWaitLockRelease(Ctx->IoLock);
     return st;
+}
+
+/* ------------------------------------------------------------------ */
+/* Block-ack (RX aggregation)                                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * EVENT_ADDBA -> HostCmd_CMD_11N_ADDBA_RSP (mwifiex 11n.c,
+ * mwifiex_cmd_11n_addba_rsp_gen): accept, our window size, no A-MSDU inside
+ * A-MPDU. EVENT_BA_STREAM_TIMEOUT -> HostCmd_CMD_11N_DELBA
+ * (mwifiex_11n_ba_stream_timeout). Frames of an RX BA session are passed up as
+ * they arrive (no host reorder buffer yet).
+ */
+VOID CardBaWorker(WDFWORKITEM Item)
+{
+    PDEVICE_CONTEXT ctx = GetCtx((WDFDEVICE)WdfWorkItemGetParentObject(Item));
+
+    for (;;) {
+        ULONG ev = 0;
+        UCHAR b[16];
+        KIRQL irql;
+        BOOLEAN have = FALSE;
+
+        KeAcquireSpinLock(&ctx->BaLock, &irql);
+        if (ctx->BaTail != ctx->BaHead) {
+            ULONG i = ctx->BaTail++ % BA_QUEUE_LEN;
+            ev = ctx->BaQueue[i].Event;
+            RtlCopyMemory(b, ctx->BaQueue[i].Body, sizeof(b));
+            have = TRUE;
+        }
+        KeReleaseSpinLock(&ctx->BaLock, irql);
+        if (!have)
+            break;
+        if (!ctx->FwReady)
+            continue;
+
+        if (ev == EVENT_ADDBA) {
+            /* req: result, mac[6], token, le16 param, le16 timeout, le16 ssn */
+            UCHAR r[17];
+            USHORT param = GetLe16(b + 8);
+            UCHAR tid = (UCHAR)((param & 0x3C) >> 2);
+            PUCHAR resp = NULL;
+            ULONG rlen = 0;
+            NTSTATUS st;
+
+            RtlZeroMemory(r, sizeof(r));
+            RtlCopyMemory(r + 1, b + 1, 6);              /* peer MAC */
+            r[7] = b[7];                                 /* dialog token */
+            PutLe16(r + 8, 0);                           /* status: accept */
+            param &= (USHORT)~0xFFC0;                    /* buffer size */
+            param &= (USHORT)~0x0001;                    /* no A-MSDU in A-MPDU */
+            param |= (USHORT)(BA_RX_WIN_SIZE << 6);
+            PutLe16(r + 10, param);
+            RtlCopyMemory(r + 12, b + 10, 2);            /* timeout */
+            RtlCopyMemory(r + 14, b + 12, 2);            /* starting sequence number */
+
+            WdfWaitLockAcquire(ctx->CmdLock, NULL);
+            st = SendCmdLocked(ctx, 0x00cf, r, sizeof(r), &resp, &rlen);
+            LOG("ba: ADDBA from %02X:%02X:%02X:%02X:%02X:%02X tid %u ssn %u -> 0x%08X result %u",
+                b[1], b[2], b[3], b[4], b[5], b[6], tid, GetLe16(b + 12) >> 4,
+                st, (NT_SUCCESS(st) && resp && rlen >= 1) ? resp[0] : 0xFF);
+            WdfWaitLockRelease(ctx->CmdLock);
+            if (NT_SUCCESS(st))
+                InterlockedIncrement(&ctx->BaSessions);
+        } else if (ev == EVENT_BA_STREAM_TIMEOUT) {
+            /* body: tid, mac[6], originator */
+            UCHAR d[12];
+            NTSTATUS st;
+            RtlZeroMemory(d, sizeof(d));
+            RtlCopyMemory(d + 1, b + 1, 6);
+            PutLe16(d + 7, (USHORT)(((USHORT)b[0] << 12) | ((USHORT)(b[7] & 1) << 11)));
+            PutLe16(d + 9, 39);                          /* WLAN_REASON_QSTA_TIMEOUT */
+            st = SendCmd(ctx, 0x00d0, d, sizeof(d), NULL, NULL);
+            LOG("ba: stream timeout tid %u originator %u -> DELBA 0x%08X", b[0], b[7], st);
+        } else {
+            /* body: result, mac[6], le16 del_ba_param_set (tid in bits 12-15) */
+            LOG("ba: DELBA from peer, tid %u", GetLe16(b + 7) >> 12);
+        }
+    }
 }

@@ -58,6 +58,20 @@ a real power-off; the D0Exit path sends `FUNC_SHUTDOWN` and an SDIO I/O reset, w
 A normal restart works (the platform power-cycles the card); resume from sleep/hibernate is
 expected to fail for the same reason (D0Entry does no re-initialisation).
 
+### No software power switch
+
+The BIOS (DSDT) has an ACPI node for SDIO function 1 under the SDIO controller,
+`\_SB.PCI0.SDHB.BRC1` (copied from Intel's Broadcom reference design), whose `_PS3`/`_PS0` drive
+GPIO `WFD3` (`\_SB.GPO3` = SOUTHEAST community, pin 75) low/high. On the Wyse 3040 it is useless:
+Windows does not link the node to the sdbus function PDO (no location path / BIOS name), and pad
+75 is not in GPIO mode at all (PADCTRL0 0x00910301: native function 1, GPIO disabled; in the
+Cherry View pin list pin 75 is `SDMMC3_1P8_EN`). So a card whose start failed can only be
+recovered by a real power loss (unplugging; a normal shutdown keeps standby power on the card).
+
+Re-detecting the card through the re-enumerate interface *after* a failed start makes it worse:
+the card does not answer, and sdbus removes the device until the next real power loss. The driver
+therefore only logs a failed START (completion routine on the START IRP).
+
 ### Firmware download timing
 
 The download (mwifiex `prog_fw_w_helper`, 16-byte header chunks + up to 2 KB data chunks, polled
@@ -80,6 +94,19 @@ a `REG_SZ` full path; `REG_EXPAND_SZ` with `%SystemRoot%` makes the session fail
 - Association: `HostCmd_CMD_802_11_ASSOCIATE` (0x12) with SSID, DS, CF, rates, auth type
   (0x11F, open), channel list and an RSN IE TLV (group cipher from the AP, pairwise CCMP, AKM PSK
   or 802.1X). The response is the IEEE association response (cap, status, AID, IEs).
+
+## 802.11n
+
+- `GET_HW_SPEC` gives `fw_cap_info` (bit 11 = 11n), `dot_11n_dev_cap` and `dev_mcs_support`
+  (offsets 34, 38, 42); `11N_CFG` (0xCD) enables HT TX at start.
+- ASSOCIATE adds an HT capabilities TLV (45), the AP's HT operation TLV (61, secondary channel
+  cleared for 20 MHz), a WMM IE (221, 00:50:F2:02) and sets the secondary-channel offset in the
+  channel-list TLV (bits 4-5 of the radio type). 40 MHz is only used on 5 GHz.
+- RX type 0xE6 = A-MSDU (subframes DA/SA/length + SNAP, padded to 4).
+- Block-ack: `EVENT_ADDBA` (0x33, body = the AP's ADDBA request) is answered with
+  `11N_ADDBA_RSP` (0xCF): accept, window 64, no A-MSDU in A-MPDU. `EVENT_BA_STREAM_TIMEOUT` (0x37)
+  -> `11N_DELBA` (0xD0). Events arrive with the I/O lock held, so the answers are sent from a work
+  item. There is no host reorder buffer yet.
 
 ## WiFiCx notes
 

@@ -16,7 +16,7 @@ static EVT_WDF_DRIVER_UNLOAD EvtDriverUnload;
 
 #pragma alloc_text(INIT, DriverEntry)
 
-#define DRIVER_BUILD L"1.0 " _CRT_WIDE(__DATE__) L" " _CRT_WIDE(__TIME__)
+#define DRIVER_BUILD L"1.7 " _CRT_WIDE(__DATE__) L" " _CRT_WIDE(__TIME__)
 
 /* HKLM\SYSTEM\CurrentControlSet\Services\mrvl8897\Parameters\SdioFlags (DWORD)
  *   bit 0 = SDIO_FLAG_DO_NOT_MANAGE_IO_ENABLE (driver enables the function itself)
@@ -105,7 +105,7 @@ static NTSTATUS OpenVolatileKey(WDFKEY *Key)
     return st;
 }
 
-static BOOLEAN ReenumDoneThisBoot(VOID)
+static ULONG ReenumCountThisBoot(VOID)
 {
     WDFKEY key;
     ULONG v = 0;
@@ -114,15 +114,15 @@ static BOOLEAN ReenumDoneThisBoot(VOID)
         (VOID)WdfRegistryQueryULong(key, &val, &v);
         WdfRegistryClose(key);
     }
-    return v != 0;
+    return v;
 }
 
-static VOID SetReenumDoneThisBoot(VOID)
+static VOID SetReenumCountThisBoot(ULONG Count)
 {
     WDFKEY key;
     DECLARE_CONST_UNICODE_STRING(val, L"Reenumerated");
     if (NT_SUCCESS(OpenVolatileKey(&key))) {
-        (VOID)WdfRegistryAssignULong(key, &val, 1);
+        (VOID)WdfRegistryAssignULong(key, &val, Count);
         WdfRegistryClose(key);
     }
 }
@@ -350,6 +350,33 @@ out:
 
 static EVT_WDFDEVICE_WDM_IRP_PREPROCESS EvtPreprocessStart;
 
+/*
+ * Runs when our START has fully completed (after KMDF's own processing) and
+ * logs a failure. sdbus sometimes still fails the start with 0xC0000001
+ * ("different card") even after the boot-time re-detection. Re-detecting again
+ * at that point does not help: the card no longer answers until it loses power
+ * and sdbus drops it entirely (tried in 1.3/1.4), so this only logs.
+ */
+static NTSTATUS StartCompletion(PDEVICE_OBJECT DevObj, PIRP Irp, PVOID Context)
+{
+    PDEVICE_CONTEXT ctx = (PDEVICE_CONTEXT)Context;
+    NTSTATUS st = Irp->IoStatus.Status;
+    UNREFERENCED_PARAMETER(DevObj);
+
+    if (Irp->PendingReturned)
+        IoMarkIrpPending(Irp);
+
+    if (NT_SUCCESS(st))
+        return STATUS_CONTINUE_COMPLETION;
+
+    LOG("IRP_MN_START_DEVICE completed 0x%08X (prepare-hardware %s)", st, ctx->PrepareRan ? "ran" : "never ran");
+    if (ctx->PrepareRan)
+        return STATUS_CONTINUE_COMPLETION;            /* our own bring-up failed */
+
+    LOG("start failed in sdbus; the card needs a full power-off (unplug) to recover");
+    return STATUS_CONTINUE_COMPLETION;
+}
+
 static NTSTATUS EvtPreprocessStart(WDFDEVICE Device, PIRP Irp)
 {
     PDEVICE_CONTEXT ctx = GetCtx(Device);
@@ -359,7 +386,7 @@ static NTSTATUS EvtPreprocessStart(WDFDEVICE Device, PIRP Irp)
 
     if (ctx->NeedReenum) {
         LARGE_INTEGER d;
-        SetReenumDoneThisBoot();
+        SetReenumCountThisBoot(1);
         if (ctx->ReenumValid && ctx->Reenum.SurpriseRemoveAndReenumerateSelf) {
             d.QuadPart = -10000LL * 500;               /* let the boot-time detection settle */
             KeDelayExecutionThread(KernelMode, FALSE, &d);
@@ -413,9 +440,12 @@ static NTSTATUS EvtPreprocessStart(WDFDEVICE Device, PIRP Irp)
      * Required by KMDF: the framework has already advanced the stack
      * location before calling a preprocess callback. Without this skip the
      * framework misreads the IRP and the start never reaches sdbus or
-     * EvtDevicePrepareHardware (v0.4-v0.6 bug).
+     * EvtDevicePrepareHardware (v0.4-v0.6 bug). Copy + completion routine is
+     * the other form WdfDeviceWdmDispatchPreprocessedIrp accepts (it behaves
+     * like IoCallDriver); the routine sees the final START status.
      */
-    IoSkipCurrentIrpStackLocation(Irp);
+    IoCopyCurrentIrpStackLocationToNext(Irp);
+    IoSetCompletionRoutine(Irp, StartCompletion, ctx, TRUE, TRUE, TRUE);
     st = WdfDeviceWdmDispatchPreprocessedIrp(Device, Irp);   /* Irp is gone after this */
     LOG("IRP_MN_START_DEVICE dispatch returned 0x%08X", st);
 
@@ -450,7 +480,8 @@ static NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT Init)
      * one-shot and deleted+flushed before any card I/O (crash safety).
      */
     BOOLEAN armed = ConsumeArm();          /* start-wifi.cmd: the controller was just restarted */
-    BOOLEAN needReenum = !armed && !ReenumDoneThisBoot();
+    ULONG reenumCount = ReenumCountThisBoot();
+    BOOLEAN needReenum = !armed && reenumCount == 0;
 
     if (armed) {
         (VOID)AutoAttempts(0, TRUE);
@@ -487,6 +518,10 @@ static NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT Init)
     ctx = GetCtx(dev);
     ctx->WdfTriageInfoPtr = WdfGetTriageInfo();
     ctx->NeedReenum = needReenum;
+    ctx->ReenumCount = reenumCount;
+    /* one spare IRP stack location for StartCompletion (EvtPreprocessStart);
+     * PnP sizes the START IRP from our (top) device object */
+    WdfDeviceWdmGetDeviceObject(dev)->StackSize++;
     ctx->Device = dev;
     KeInitializeEvent(&ctx->CmdDone, NotificationEvent, FALSE);
 
@@ -496,6 +531,18 @@ static NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT Init)
     st = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &ctx->CmdLock);
     if (!NT_SUCCESS(st))
         return st;
+
+    KeInitializeSpinLock(&ctx->BaLock);
+    {
+        WDF_WORKITEM_CONFIG wcfg;
+        WDF_OBJECT_ATTRIBUTES wattr;
+        WDF_WORKITEM_CONFIG_INIT(&wcfg, CardBaWorker);
+        WDF_OBJECT_ATTRIBUTES_INIT(&wattr);
+        wattr.ParentObject = dev;
+        st = WdfWorkItemCreate(&wcfg, &wattr, &ctx->BaWork);
+        if (!NT_SUCCESS(st))
+            return st;
+    }
 
     st = WifiDeviceInitPost(dev);
     if (!NT_SUCCESS(st)) {
@@ -515,13 +562,15 @@ static NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT Init)
     g_Experiment = ctx->Options & OPT_EXPERIMENT;
     LOG("EvtDeviceAdd: SdioFlags option value 0x%X", ctx->Options);
 
+    /* sdbus's re-enumerate interface (used by the boot instance at its START) */
+    ctx->Reenum.Size = sizeof(ctx->Reenum);
+    ctx->Reenum.Version = 1;
+    st = WdfFdoQueryForInterface(dev, &MrvlGuidReenumerateSelf, (PINTERFACE)&ctx->Reenum,
+                                 sizeof(ctx->Reenum), 1, NULL);
+    ctx->ReenumValid = NT_SUCCESS(st);
+
     if (needReenum) {
-        /* Don't touch the card in this instance; just get sdbus's re-enumerate interface. */
-        ctx->Reenum.Size = sizeof(ctx->Reenum);
-        ctx->Reenum.Version = 1;
-        st = WdfFdoQueryForInterface(dev, &MrvlGuidReenumerateSelf, (PINTERFACE)&ctx->Reenum,
-                                     sizeof(ctx->Reenum), 1, NULL);
-        ctx->ReenumValid = NT_SUCCESS(st);
+        /* Don't touch the card in this instance. */
         LOG("boot instance: re-enumerate interface 0x%08X; the card is re-detected at START", st);
         WriteDiag(ctx, "boot-waiting-for-start", st);
         return STATUS_SUCCESS;
@@ -530,7 +579,7 @@ static NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT Init)
     ctx->CountedAttempt = !armed;
     if (ctx->CountedAttempt)
         (VOID)AutoAttempts(1, FALSE);
-    LOG("%s: doing full bring-up", armed ? "armed by start-wifi" : "automatic start");
+    LOG("%s: doing full bring-up (re-detections this boot: %u)", armed ? "armed by start-wifi" : "automatic start", reenumCount);
 
     if (ctx->Options & OPT_LATE_ATTACH) {
         WriteDiag(ctx, "device-add-ok (late attach)", STATUS_SUCCESS);
@@ -555,6 +604,8 @@ static NTSTATUS EvtPrepareHardware(WDFDEVICE Device, WDFCMRESLIST Raw, WDFCMRESL
     NTSTATUS st;
     UNREFERENCED_PARAMETER(Raw);
     UNREFERENCED_PARAMETER(Translated);
+
+    ctx->PrepareRan = TRUE;
 
     LOG("EvtPrepareHardware enter");
     WriteDiag(ctx, "prepare-hardware", STATUS_PENDING);
