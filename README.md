@@ -1,6 +1,6 @@
 # mrvl8897 — Marvell 88W8897 SDIO Wi-Fi driver for Windows 11
 
-**Version 1.7**
+**Version 1.8**
 
 A Windows 11 x64 driver for the **Marvell 88W8897 Wi-Fi chip on SDIO**, developed and tested on
 the **Dell Wyse 3040** thin client (Intel Cherry Trail, SDIO host 8086:2295). Marvell only ever
@@ -32,10 +32,9 @@ Not yet:
 - Other machines with the SDIO 88W8897 are untested (they should work if the SD host is
   handled by Windows' sdbus)
 - 802.11ac; DFS channels 52-144; TX block-ack (upload aggregation); RX reorder buffer
-- Real throughput is far below the link speed (about 30 Mbit/s measured with iperf): every
-  packet is a separate SDIO transfer (no SDIO multi-port aggregation yet)
-- Booting is occasionally flaky (the device shows a yellow bang); a full power-off with the
-  power cord unplugged brings it back
+- Real throughput is far below the link speed (about 45 Mbit/s measured with iperf): the SDIO
+  bus runs at 25 MHz (see step 1.4 of the install) and every packet is a separate SDIO transfer
+  (no SDIO multi-port aggregation yet)
 - WPA3-only networks (WPA2/WPA3 mixed networks connect via WPA2), TKIP pairwise, WEP
 - Sleep / hibernate / Fast Startup: Wi-Fi will probably not come back after resume (the card
   can't be re-initialised without a power cycle); use Shut down / Restart instead of sleep
@@ -55,6 +54,16 @@ The driver is **test-signed** (not signed by Microsoft), so the PC must allow te
    certutil -addstore TrustedPublisher mrvl8897-test.cer
    ```
 3. Restart.
+4. Limit the SDIO bus speed. Without this, Windows' SD bus driver switches the card to its 200 MHz
+   UHS mode (SDR104), whose signal tuning fails on some boots and leaves the card dead until it
+   loses power (the "flaky boot" with a yellow bang). In an administrator PowerShell:
+   ```powershell
+   $wifi = Get-PnpDevice | ? InstanceId -match '^SD\\VID_02DF&PID_912C&FN_1'
+   $ctl  = (Get-PnpDeviceProperty -InstanceId $wifi.InstanceId -KeyName DEVPKEY_Device_Parent).Data
+   foreach ($slot in 0, 1) { reg add "HKLM\SYSTEM\CurrentControlSet\Enum\$ctl\Device Parameters\$slot" /v OverrideFlags /t REG_DWORD /d 0x40 /f }
+   ```
+   This only affects the Wi-Fi's SDIO controller (per-slot setting under its own registry
+   entry), not the eMMC the system boots from. It applies from the next boot.
 
 ### 2. Install the driver
 
@@ -62,17 +71,39 @@ Device Manager → the unknown `SD\VID_02DF&PID_912C&FN_1` device → **Update d
 **Browse my computer for drivers** → **Let me pick from a list** → **Have Disk…** →
 select `mrvl8897.inf` → OK → Next.
 
-### 3. Power-cycle once
+### 3. Restart
 
-Shut down completely (hold **Shift** while clicking Shut down), then power on. Once the card's
-firmware has run, the card can only be initialised again after it lost power, so this cold
-power-cycle is needed **after installing or updating the driver** (and after disabling/enabling
-the device). From then on Wi-Fi comes up by itself at every boot, restarts included.
+Windows asks for a restart after the install; restart when asked. The device usually shows a
+yellow bang (code 10) right after the install: Windows starts it immediately, and that start
+fails. From then on Wi-Fi comes up by itself at boot, restarts included (with the occasional
+failed boot listed under "Not yet").
 
-If the device is missing or shows a yellow bang even after that, shut down, **unplug the power
+Disabling and re-enabling the device in Device Manager has the same problem as starting it right
+after an install; restart (or power off) instead.
+
+If the device is missing or shows a yellow bang after the restart, shut down, **unplug the power
 cord** for a few minutes and power on again: a "shut down" leaves standby power on the card, and
 a card that failed to start only recovers once it really loses power. There is no software way
 to power-cycle the card on the Wyse 3040 (see docs/TECHNICAL.md).
+
+## Uninstall (remove every version)
+
+In an administrator PowerShell:
+
+```powershell
+Get-WindowsDriver -Online | ? { $_.OriginalFileName -like '*\mrvl8897.inf' } | % { pnputil /delete-driver $_.Driver /uninstall /force }
+Get-PnpDevice | ? InstanceId -match '^SD\\VID_02DF&PID_912[CD]&FN_1' | % { pnputil /remove-device $_.InstanceId }
+reg delete HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus /f
+reg delete HKLM\SYSTEM\CurrentControlSet\Services\mrvl8897 /f
+Remove-Item "$env:windir\System32\drivers\mrvl8897.sys","$env:windir\System32\drivers\sd8897_uapsta.bin" -ErrorAction SilentlyContinue
+```
+
+To also undo the bus-speed limit from install step 1.4, delete the `OverrideFlags` values again
+(same paths as there, `reg delete ... /v OverrideFlags /f`).
+
+This removes all mrvl8897 packages from the driver store, the device entry, the boot trace, the
+driver's settings and logs, and the installed files. Restart afterwards; the card shows up as an
+unknown device again.
 
 ## Build
 

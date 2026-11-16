@@ -10,7 +10,7 @@ Class       = Net
 ClassGuid   = {4d36e972-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
 CatalogFile = mrvl8897.cat
-DriverVer   = 11/16/2026,1.7.0.0
+DriverVer   = 11/16/2026,1.8.0.0
 PnpLockdown = 1
 
 [DestinationDirs]
@@ -35,6 +35,11 @@ sd8897_uapsta.bin = 1
 %DevDesc% = Mrvl_Inst, SD\VID_02DF&PID_912D
 
 [Mrvl_Inst.NT]
+; Ask for a restart instead of starting the device right away: a start right after
+; install/update fails (the card needs the boot-time sequence) and leaves it unusable
+; until a power-off. With Reboot the device waits ("restart required") and starts
+; normally at the next boot.
+Reboot
 CopyFiles       = Drv_CopyFiles, Fw_CopyFiles
 AddReg          = Mrvl_Ndi, Mrvl_BootTrace
 Characteristics = 0x84          ; NCF_HAS_UI | NCF_PHYSICAL

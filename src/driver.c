@@ -16,7 +16,7 @@ static EVT_WDF_DRIVER_UNLOAD EvtDriverUnload;
 
 #pragma alloc_text(INIT, DriverEntry)
 
-#define DRIVER_BUILD L"1.7 " _CRT_WIDE(__DATE__) L" " _CRT_WIDE(__TIME__)
+#define DRIVER_BUILD L"1.8 " _CRT_WIDE(__DATE__) L" " _CRT_WIDE(__TIME__)
 
 /* HKLM\SYSTEM\CurrentControlSet\Services\mrvl8897\Parameters\SdioFlags (DWORD)
  *   bit 0 = SDIO_FLAG_DO_NOT_MANAGE_IO_ENABLE (driver enables the function itself)

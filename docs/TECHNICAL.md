@@ -37,6 +37,24 @@ needed once the card has been re-detected (confirmed on the Wyse 3040 with the f
 (`Services\sdbus\Parameters`): the same driver runs the boot eMMC, and `DisableRuntimePower` there
 made the machine unbootable.
 
+### The real cause of failed boots: UHS tuning
+
+An sdbus trace of a failed boot (`mrvl8897-sdbus.etl`) shows that the OCR mismatch at that point
+is a consequence, not the cause. The function START after the re-detection first succeeds (CMD5
+returns 0xFF8000, matching), then sdbus switches the card to SDR104 (CMD52 write 0x06 to CCCR
+0x13, clock 200 MHz). The tuning that follows (CMD19, 11 attempts) fails, the next CMD52 times out
+and the step fails with `0xC0000185`. sdbus then re-runs the whole initialisation without a real
+power cycle; the card is still set to the voltage selected moments before and now answers CMD5
+with OCR 0x040000, which no longer matches the saved 0xFF8000 -> `0xC0000001`. The card stays in
+that state until it loses power.
+
+Per-slot `OverrideFlags` (controller `Device Parameters\<slot>`, stored at socket+48h, default =
+the global hack flags) bit **0x40** makes `SdbusHighSpeedDetectionWorker` skip the UHS modes.
+With it the card runs at 25 MHz, 4 bit (SDP_BUS_CLOCK reports 25000 instead of 200000) and boots
+reliably; measured throughput about 45 Mbit/s. Bit 0x40000000 is tested in `SdhcExecuteRetuning`
+(not tried). The card supports high speed (CCCR 0x13 = 0x01, SHS), so 50 MHz is a possible later
+step.
+
 ### Re-enumeration
 
 sdbus implements `GUID_REENUMERATE_SELF_INTERFACE_STANDARD` on the function PDO
