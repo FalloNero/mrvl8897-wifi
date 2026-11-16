@@ -1,6 +1,6 @@
 # mrvl8897 — Marvell 88W8897 SDIO Wi-Fi driver for Windows 11
 
-**Version 1.8**
+**Version 1.9**
 
 A Windows 11 x64 driver for the **Marvell 88W8897 Wi-Fi chip on SDIO**, developed and tested on
 the **Dell Wyse 3040** thin client (Intel Cherry Trail, SDIO host 8086:2295). Marvell only ever
@@ -33,7 +33,7 @@ Not yet:
   handled by Windows' sdbus)
 - 802.11ac; DFS channels 52-144; TX block-ack (upload aggregation); RX reorder buffer
 - Real throughput is far below the link speed (about 45 Mbit/s measured with iperf): the SDIO
-  bus runs at 25 MHz (see step 1.4 of the install) and every packet is a separate SDIO transfer
+  bus runs at 25 MHz (see "How it works") and every packet is a separate SDIO transfer
   (no SDIO multi-port aggregation yet)
 - WPA3-only networks (WPA2/WPA3 mixed networks connect via WPA2), TKIP pairwise, WEP
 - Sleep / hibernate / Fast Startup: Wi-Fi will probably not come back after resume (the card
@@ -54,16 +54,6 @@ The driver is **test-signed** (not signed by Microsoft), so the PC must allow te
    certutil -addstore TrustedPublisher mrvl8897-test.cer
    ```
 3. Restart.
-4. Limit the SDIO bus speed. Without this, Windows' SD bus driver switches the card to its 200 MHz
-   UHS mode (SDR104), whose signal tuning fails on some boots and leaves the card dead until it
-   loses power (the "flaky boot" with a yellow bang). In an administrator PowerShell:
-   ```powershell
-   $wifi = Get-PnpDevice | ? InstanceId -match '^SD\\VID_02DF&PID_912C&FN_1'
-   $ctl  = (Get-PnpDeviceProperty -InstanceId $wifi.InstanceId -KeyName DEVPKEY_Device_Parent).Data
-   foreach ($slot in 0, 1) { reg add "HKLM\SYSTEM\CurrentControlSet\Enum\$ctl\Device Parameters\$slot" /v OverrideFlags /t REG_DWORD /d 0x40 /f }
-   ```
-   This only affects the Wi-Fi's SDIO controller (per-slot setting under its own registry
-   entry), not the eMMC the system boots from. It applies from the next boot.
 
 ### 2. Install the driver
 
@@ -73,13 +63,10 @@ select `mrvl8897.inf` → OK → Next.
 
 ### 3. Restart
 
-Windows asks for a restart after the install; restart when asked. The device usually shows a
-yellow bang (code 10) right after the install: Windows starts it immediately, and that start
-fails. From then on Wi-Fi comes up by itself at boot, restarts included (with the occasional
-failed boot listed under "Not yet").
-
-Disabling and re-enabling the device in Device Manager has the same problem as starting it right
-after an install; restart (or power off) instead.
+After the install the device shows "Windows needs to restart" (code 14) instead of starting:
+restart the PC. The same happens after a driver update or after disabling/enabling the device in
+Device Manager: the card can only be initialised once per boot, so the driver waits for the
+restart instead of failing. After the restart Wi-Fi comes up by itself at every boot.
 
 If the device is missing or shows a yellow bang after the restart, shut down, **unplug the power
 cord** for a few minutes and power on again: a "shut down" leaves standby power on the card, and
@@ -91,6 +78,9 @@ to power-cycle the card on the Wyse 3040 (see docs/TECHNICAL.md).
 In an administrator PowerShell:
 
 ```powershell
+$wifi = Get-PnpDevice | ? InstanceId -match '^SD\\VID_02DF&PID_912C&FN_1'
+$ctl = (Get-PnpDeviceProperty -InstanceId $wifi.InstanceId -KeyName DEVPKEY_Device_Parent).Data
+foreach ($s in 0, 1) { reg delete "HKLM\SYSTEM\CurrentControlSet\Enum\$ctl\Device Parameters\$s" /v OverrideFlags /f }
 Get-WindowsDriver -Online | ? { $_.OriginalFileName -like '*\mrvl8897.inf' } | % { pnputil /delete-driver $_.Driver /uninstall /force }
 Get-PnpDevice | ? InstanceId -match '^SD\\VID_02DF&PID_912[CD]&FN_1' | % { pnputil /remove-device $_.InstanceId }
 reg delete HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\mrvl8897-sdbus /f
@@ -98,12 +88,10 @@ reg delete HKLM\SYSTEM\CurrentControlSet\Services\mrvl8897 /f
 Remove-Item "$env:windir\System32\drivers\mrvl8897.sys","$env:windir\System32\drivers\sd8897_uapsta.bin" -ErrorAction SilentlyContinue
 ```
 
-To also undo the bus-speed limit from install step 1.4, delete the `OverrideFlags` values again
-(same paths as there, `reg delete ... /v OverrideFlags /f`).
-
 This removes all mrvl8897 packages from the driver store, the device entry, the boot trace, the
-driver's settings and logs, and the installed files. Restart afterwards; the card shows up as an
-unknown device again.
+driver's settings and logs, the installed files, and the bus-speed setting the driver made on
+the SDIO controller (see "How it works"). Restart afterwards; the card shows up as an unknown
+device again.
 
 ## Build
 
@@ -132,6 +120,11 @@ See [docs/TECHNICAL.md](docs/TECHNICAL.md) for the details. In short:
   driver therefore asks the SD bus driver to re-detect the card (the documented
   `GUID_REENUMERATE_SELF_INTERFACE_STANDARD` interface, which sdbus implements); the re-created
   device then starts normally.
+- **Bus speed**: the driver sets `OverrideFlags` = 0x40 on its own SDIO controller's slot keys
+  (`Enum\<controller>\Device Parameters\0` and `\1`; never the global sdbus parameters), which
+  makes Windows' SD bus driver skip the 200 MHz UHS mode whose signal tuning fails on some boots.
+  The card runs at 25 MHz. sdbus reads the value when the controller starts, so the first install
+  asks for a restart.
 - **Boot trace**: the firmware download only completes while the SD bus driver's WPP tracing is
   active (it changes sdbus's timing). The INF therefore registers a Windows boot trace
   ("AutoLogger") `mrvl8897-sdbus` with a 64 MB ring file in `C:\Windows\System32\LogFiles\WMI\`.

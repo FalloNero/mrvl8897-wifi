@@ -10,7 +10,7 @@ Class       = Net
 ClassGuid   = {4d36e972-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
 CatalogFile = mrvl8897.cat
-DriverVer   = 11/16/2026,1.8.0.0
+DriverVer   = 11/16/2026,1.9.0.0
 PnpLockdown = 1
 
 [DestinationDirs]

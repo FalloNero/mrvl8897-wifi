@@ -148,6 +148,7 @@ typedef struct _DEVICE_CONTEXT {
 
     /* boot-time self re-enumeration (see driver.c) */
     BOOLEAN                  NeedReenum;
+    BOOLEAN                  NeedRestart;   /* answer START with STATUS_PNP_REBOOT_REQUIRED */
     BOOLEAN                  ReenumValid;
     BOOLEAN                  CountedAttempt;
     BOOLEAN                  PrepareRan;  /* EvtDevicePrepareHardware was reached */

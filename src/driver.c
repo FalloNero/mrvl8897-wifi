@@ -16,7 +16,7 @@ static EVT_WDF_DRIVER_UNLOAD EvtDriverUnload;
 
 #pragma alloc_text(INIT, DriverEntry)
 
-#define DRIVER_BUILD L"1.8 " _CRT_WIDE(__DATE__) L" " _CRT_WIDE(__TIME__)
+#define DRIVER_BUILD L"1.9 " _CRT_WIDE(__DATE__) L" " _CRT_WIDE(__TIME__)
 
 /* HKLM\SYSTEM\CurrentControlSet\Services\mrvl8897\Parameters\SdioFlags (DWORD)
  *   bit 0 = SDIO_FLAG_DO_NOT_MANAGE_IO_ENABLE (driver enables the function itself)
@@ -125,6 +125,103 @@ static VOID SetReenumCountThisBoot(ULONG Count)
         (VOID)WdfRegistryAssignULong(key, &val, Count);
         WdfRegistryClose(key);
     }
+}
+
+/* Other volatile per-boot flags (ThisBoot\<Name>, gone after a restart). */
+static ULONG GetThisBoot(PCWSTR Name)
+{
+    WDFKEY key;
+    ULONG v = 0;
+    UNICODE_STRING val;
+    RtlInitUnicodeString(&val, Name);
+    if (NT_SUCCESS(OpenVolatileKey(&key))) {
+        (VOID)WdfRegistryQueryULong(key, &val, &v);
+        WdfRegistryClose(key);
+    }
+    return v;
+}
+
+static VOID SetThisBoot(PCWSTR Name)
+{
+    WDFKEY key;
+    UNICODE_STRING val;
+    RtlInitUnicodeString(&val, Name);
+    if (NT_SUCCESS(OpenVolatileKey(&key))) {
+        (VOID)WdfRegistryAssignULong(key, &val, 1);
+        WdfRegistryClose(key);
+    }
+}
+
+/*
+ * SDIO bus speed limit. Without it sdbus switches the card to SDR104 (200 MHz);
+ * the CMD19 tuning that needs fails on some boots, sdbus then re-initialises the
+ * card without a power cycle, the card's OCR no longer matches and the START fails
+ * with 0xC0000001, leaving the card dead until it loses power. sdbus's per-slot
+ * OverrideFlags bit 0x40 (read from <controller>\Device Parameters\<slot> when the
+ * controller starts) makes it skip the UHS modes: 25 MHz, reliable.
+ *
+ * Only the Wi-Fi's own SDIO controller (our parent device) is changed, never the
+ * global sdbus parameters (the boot eMMC is on another controller).
+ * Returns TRUE if the value had to be written now (takes effect after a restart).
+ */
+#define SDBUS_OVERRIDE_NO_UHS 0x40
+
+static const DEVPROPKEY MrvlDevpkeyDeviceParent =
+    { { 0x4340a6c5, 0x93fa, 0x4706, { 0x97, 0x2c, 0x7b, 0x64, 0x80, 0x08, 0xa5, 0xa7 } }, 8 };
+
+static BOOLEAN EnsureSpeedLimit(WDFDEVICE Device)
+{
+    PDEVICE_OBJECT pdo = WdfDeviceWdmGetPhysicalDevice(Device);
+    WCHAR parent[200];
+    ULONG req = 0;
+    DEVPROPTYPE type = 0;
+    BOOLEAN wrote = FALSE;
+    NTSTATUS st;
+    ULONG slot;
+
+    RtlZeroMemory(parent, sizeof(parent));
+    st = IoGetDevicePropertyData(pdo, &MrvlDevpkeyDeviceParent, LOCALE_NEUTRAL, 0,
+                                 sizeof(parent) - sizeof(WCHAR), parent, &req, &type);
+    if (!NT_SUCCESS(st) || type != DEVPROP_TYPE_STRING || !parent[0]) {
+        LOG("speed limit: can't get the SDIO controller's instance id (0x%08X)", st);
+        return FALSE;
+    }
+
+    for (slot = 0; slot < 2; slot++) {
+        WCHAR path[400];
+        UNICODE_STRING us, vname;
+        OBJECT_ATTRIBUTES oa;
+        HANDLE h;
+        UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+        PKEY_VALUE_PARTIAL_INFORMATION kv = (PKEY_VALUE_PARTIAL_INFORMATION)buf;
+        ULONG cb = 0, cur = 0;
+
+        if (!NT_SUCCESS(RtlStringCbPrintfW(path, sizeof(path),
+                L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Enum\\%ws\\Device Parameters\\%u", parent, slot)))
+            continue;
+        RtlInitUnicodeString(&us, path);
+        InitializeObjectAttributes(&oa, &us, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+        st = ZwCreateKey(&h, KEY_READ | KEY_WRITE, &oa, 0, NULL, REG_OPTION_NON_VOLATILE, NULL);
+        if (!NT_SUCCESS(st)) {
+            LOG("speed limit: open %ws failed 0x%08X", path, st);
+            continue;
+        }
+        RtlInitUnicodeString(&vname, L"OverrideFlags");
+        if (NT_SUCCESS(ZwQueryValueKey(h, &vname, KeyValuePartialInformation, kv, sizeof(buf), &cb)) &&
+            kv->Type == REG_DWORD && kv->DataLength == sizeof(ULONG))
+            cur = *(ULONG UNALIGNED *)kv->Data;
+        if (!(cur & SDBUS_OVERRIDE_NO_UHS)) {
+            ULONG nv = cur | SDBUS_OVERRIDE_NO_UHS;
+            st = ZwSetValueKey(h, &vname, 0, REG_DWORD, &nv, sizeof(nv));
+            if (NT_SUCCESS(st)) {
+                (VOID)ZwFlushKey(h);
+                wrote = TRUE;
+            }
+            LOG("speed limit: slot %u OverrideFlags 0x%X -> 0x%X: 0x%08X", slot, cur, nv, st);
+        }
+        ZwClose(h);
+    }
+    return wrote;
 }
 
 /*
@@ -384,6 +481,18 @@ static NTSTATUS EvtPreprocessStart(WDFDEVICE Device, PIRP Irp)
 
     LOG("IRP_MN_START_DEVICE received");
 
+    if (ctx->NeedRestart) {
+        /* Don't let this START reach sdbus (it would fail and wedge the card).
+         * STATUS_PNP_REBOOT_REQUIRED: Windows shows "restart your computer"
+         * (code 14) instead of error 10, and the device starts after the restart. */
+        LOG("restart required before the card can start; not starting now");
+        WriteDiag(ctx, "restart-required", STATUS_PNP_REBOOT_REQUIRED);
+        Irp->IoStatus.Status = STATUS_PNP_REBOOT_REQUIRED;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_PNP_REBOOT_REQUIRED;
+    }
+
     if (ctx->NeedReenum) {
         LARGE_INTEGER d;
         SetReenumCountThisBoot(1);
@@ -444,6 +553,7 @@ static NTSTATUS EvtPreprocessStart(WDFDEVICE Device, PIRP Irp)
      * the other form WdfDeviceWdmDispatchPreprocessedIrp accepts (it behaves
      * like IoCallDriver); the routine sees the final START status.
      */
+    SetThisBoot(L"CardStarted");   /* any later START this boot needs a restart first */
     IoCopyCurrentIrpStackLocationToNext(Irp);
     IoSetCompletionRoutine(Irp, StartCompletion, ctx, TRUE, TRUE, TRUE);
     st = WdfDeviceWdmDispatchPreprocessedIrp(Device, Irp);   /* Irp is gone after this */
@@ -481,11 +591,14 @@ static NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT Init)
      */
     BOOLEAN armed = ConsumeArm();          /* start-wifi.cmd: the controller was just restarted */
     ULONG reenumCount = ReenumCountThisBoot();
-    BOOLEAN needReenum = !armed && reenumCount == 0;
+    /* A START already reached sdbus this boot (driver install/update, disable/enable):
+     * the card can only be initialised again after a restart. */
+    BOOLEAN needRestart = !armed && GetThisBoot(L"CardStarted") != 0;
+    BOOLEAN needReenum = !armed && !needRestart && reenumCount == 0;
 
     if (armed) {
         (VOID)AutoAttempts(0, TRUE);
-    } else if (!needReenum && AutoAttempts(0, FALSE) >= 2) {
+    } else if (!needReenum && !needRestart && AutoAttempts(0, FALSE) >= 2) {
         LOG("automatic start disabled: the last 2 bring-ups never finished (crash?). Run start-wifi.cmd.");
         return STATUS_DEVICE_NOT_READY;
     }
@@ -517,8 +630,17 @@ static NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT Init)
 
     ctx = GetCtx(dev);
     ctx->WdfTriageInfoPtr = WdfGetTriageInfo();
-    ctx->NeedReenum = needReenum;
     ctx->ReenumCount = reenumCount;
+    /* The bus speed limit is read by sdbus when the controller starts: if it had to
+     * be written now (first install), the card can only start after a restart. */
+    if (EnsureSpeedLimit(dev))
+        SetThisBoot(L"SpeedLimitSet");
+    if (!armed && GetThisBoot(L"SpeedLimitSet"))
+        needRestart = TRUE;
+    if (needRestart)
+        needReenum = FALSE;
+    ctx->NeedRestart = needRestart;
+    ctx->NeedReenum = needReenum;
     /* one spare IRP stack location for StartCompletion (EvtPreprocessStart);
      * PnP sizes the START IRP from our (top) device object */
     WdfDeviceWdmGetDeviceObject(dev)->StackSize++;
@@ -568,6 +690,13 @@ static NTSTATUS EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT Init)
     st = WdfFdoQueryForInterface(dev, &MrvlGuidReenumerateSelf, (PINTERFACE)&ctx->Reenum,
                                  sizeof(ctx->Reenum), 1, NULL);
     ctx->ReenumValid = NT_SUCCESS(st);
+
+    if (needRestart) {
+        /* Don't touch the card; START is answered with "restart required". */
+        LOG("restart required (driver installed/updated or device restarted this boot)");
+        WriteDiag(ctx, "waiting-for-restart", STATUS_PNP_REBOOT_REQUIRED);
+        return STATUS_SUCCESS;
+    }
 
     if (needReenum) {
         /* Don't touch the card in this instance. */

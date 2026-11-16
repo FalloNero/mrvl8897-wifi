@@ -52,7 +52,11 @@ Per-slot `OverrideFlags` (controller `Device Parameters\<slot>`, stored at socke
 the global hack flags) bit **0x40** makes `SdbusHighSpeedDetectionWorker` skip the UHS modes.
 With it the card runs at 25 MHz, 4 bit (SDP_BUS_CLOCK reports 25000 instead of 200000) and boots
 reliably; measured throughput about 45 Mbit/s. Bit 0x40000000 is tested in `SdhcExecuteRetuning`
-(not tried). The card supports high speed (CCCR 0x13 = 0x01, SHS), so 50 MHz is a possible later
+(not tried). The driver writes the value itself (`EnsureSpeedLimit` in driver.c, parent instance
+from `DEVPKEY_Device_Parent`); if it had to write it this boot, or if a START already reached sdbus
+this boot (install/update, disable/enable), the START is completed with
+`STATUS_PNP_REBOOT_REQUIRED` without reaching sdbus, so Windows shows "restart required" (code 14)
+instead of a failed start. The card supports high speed (CCCR 0x13 = 0x01, SHS), so 50 MHz is a possible later
 step.
 
 ### Re-enumeration
